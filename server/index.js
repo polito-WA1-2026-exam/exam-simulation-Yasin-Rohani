@@ -141,30 +141,24 @@ app.put('/api/studyplan', isLoggedIn, (req, res) => {
     return res.status(400).json({ error: 'Courses array is required' });
   }
 
+  if (courses.length === 0) {
+    return res.status(400).json({ error: 'Study plan cannot be empty' });
+  }
+
   const uniqueCourses = [...new Set(courses)];
 
   if (uniqueCourses.length !== courses.length) {
     return res.status(400).json({ error: 'Duplicate courses are not allowed' });
   }
 
-  const sqlPlan = `
-    SELECT type
-    FROM study_plans
-    WHERE user_id = ?
-  `;
-
-  db.get(sqlPlan, [userId], (err, plan) => {
+  db.get('SELECT type FROM study_plans WHERE user_id = ?', [userId], (err, plan) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!plan) return res.status(404).json({ error: 'Study plan not found' });
-
-    if (courses.length === 0) {
-      return res.status(400).json({ error: 'Study plan cannot be empty' });
-    }
 
     const placeholders = courses.map(() => '?').join(',');
 
     const sqlCourses = `
-      SELECT code, credits
+      SELECT code, credits, preparatory_code
       FROM courses
       WHERE code IN (${placeholders})
     `;
@@ -178,43 +172,101 @@ app.put('/api/studyplan', isLoggedIn, (req, res) => {
 
       const totalCredits = selectedCourses.reduce((sum, course) => sum + course.credits, 0);
 
-      if (plan.type === 'full-time' && (totalCredits < 60 || totalCredits > 80)) {
-        return res.status(400).json({
-          error: 'Full-time must be between 60 and 80 credits'
-        });
-      }
+      const sqlIncompatibilities = `
+        SELECT course_code, incompatible_code
+        FROM incompatibilities
+        WHERE course_code IN (${placeholders})
+          AND incompatible_code IN (${placeholders})
+      `;
 
-      if (plan.type === 'part-time' && (totalCredits < 20 || totalCredits > 40)) {
-        return res.status(400).json({
-          error: 'Part-time must be between 20 and 40 credits'
-        });
-      }
-
-      db.run('DELETE FROM study_plan_courses WHERE user_id = ?', [userId], (err) => {
+      db.all(sqlIncompatibilities, [...courses, ...courses], (err, incompatibleRows) => {
         if (err) return res.status(500).json({ error: 'Database error' });
 
-        const stmt = db.prepare(`
-          INSERT INTO study_plan_courses(user_id, course_code)
-          VALUES (?, ?)
-        `);
-
-        for (const courseCode of courses) {
-          stmt.run(userId, courseCode);
+        if (incompatibleRows.length > 0) {
+          return res.status(400).json({
+            error: 'Incompatible courses selected',
+            details: incompatibleRows
+          });
         }
 
-        stmt.finalize((err) => {
+        const missingPreparatory = selectedCourses
+          .filter(course => course.preparatory_code && !courses.includes(course.preparatory_code))
+          .map(course => ({
+            course: course.code,
+            missingPreparatory: course.preparatory_code
+          }));
+
+        if (missingPreparatory.length > 0) {
+          return res.status(400).json({
+            error: 'Missing preparatory courses',
+            details: missingPreparatory
+          });
+        }
+
+        if (plan.type === 'full-time' && (totalCredits < 60 || totalCredits > 80)) {
+          return res.status(400).json({
+            error: 'Full-time must be between 60 and 80 credits'
+          });
+        }
+
+        if (plan.type === 'part-time' && (totalCredits < 20 || totalCredits > 40)) {
+          return res.status(400).json({
+            error: 'Part-time must be between 20 and 40 credits'
+          });
+        }
+
+        const sqlCapacity = `
+          SELECT
+            c.code,
+            c.max_students,
+            COUNT(spc.course_code) AS enrolled
+          FROM courses c
+          LEFT JOIN study_plan_courses spc
+            ON c.code = spc.course_code
+          WHERE c.code IN (${placeholders})
+          GROUP BY c.code
+        `;
+
+        db.all(sqlCapacity, courses, (err, capacityRows) => {
           if (err) return res.status(500).json({ error: 'Database error' });
 
-          res.status(200).json({
-            message: 'Study plan updated',
-            totalCredits
+          const fullCourses = capacityRows.filter(course => {
+            return course.max_students !== null && course.enrolled >= course.max_students;
+          });
+
+          if (fullCourses.length > 0) {
+            return res.status(400).json({
+              error: 'Course capacity exceeded',
+              details: fullCourses
+            });
+          }
+
+          db.run('DELETE FROM study_plan_courses WHERE user_id = ?', [userId], (err) => {
+            if (err) return res.status(500).json({ error: 'Database error' });
+
+            const stmt = db.prepare(`
+              INSERT INTO study_plan_courses(user_id, course_code)
+              VALUES (?, ?)
+            `);
+
+            for (const courseCode of courses) {
+              stmt.run(userId, courseCode);
+            }
+
+            stmt.finalize((err) => {
+              if (err) return res.status(500).json({ error: 'Database error' });
+
+              return res.status(200).json({
+                message: 'Study plan updated',
+                totalCredits
+              });
+            });
           });
         });
       });
     });
   });
 });
-
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
